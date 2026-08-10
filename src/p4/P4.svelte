@@ -22,6 +22,8 @@
     PRIVACY_POLICY
   } from '../packager/brand';
 
+  const OPEN_VERSION = 'v1.0.0';
+
   let projectData;
 
   const darkMedia = window.matchMedia('(prefers-color-scheme: dark)');
@@ -126,9 +128,27 @@
   .version a {
     color: inherit;
   }
+  .open-version {
+    position: fixed;
+    top: 8px;
+    right: 12px;
+    font-size: 11px;
+    color: #888;
+    background: rgba(255, 255, 255, 0.9);
+    padding: 2px 8px;
+    border-radius: 4px;
+    z-index: 1000;
+    pointer-events: none;
+  }
+  :global([theme="dark"]) .open-version {
+    background: rgba(30, 30, 30, 0.9);
+    color: #aaa;
+  }
 </style>
 
 <Modals bind:modalVisible={modalVisible} />
+
+<div class="open-version">{OPEN_VERSION}</div>
 
 <main aria-hidden={modalVisible} class:is-not-safari={!isSafari}>
   <Section accent={ACCENT_COLOR}>

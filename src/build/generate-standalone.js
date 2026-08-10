@@ -12,7 +12,7 @@ console.log(`scaffolding: ${scaffoldingFiles.join(', ')}`);
 const scaffoldingAssets = {};
 for (const path of scaffoldingFiles) {
   if (path.includes('extension-worker')) continue;
-  scaffoldingAssets[path] = fs.readFileSync(pathUtil.join(dist, path), 'utf-8');
+  scaffoldingAssets[path] = fs.readFileSync(pathUtil.join(dist, path), 'utf8');
 }
 
 const indexPath = pathUtil.join(dist, 'index.html');
@@ -21,7 +21,25 @@ const indexContent = fs.readFileSync(indexPath, 'utf8');
 
 const jsPath = pathUtil.join(dist, indexContent.match(/<script src="(.*)"><\/script>/)[1]);
 console.log(`packager.js: ${jsPath}`);
-const jsContent = fs.readFileSync(jsPath, 'utf-8');
+const jsContent = fs.readFileSync(jsPath, 'utf8');
+
+// 内联所有 webpack chunk 文件
+const jsDir = pathUtil.join(dist, 'js');
+const allJSFiles = fs.readdirSync(jsDir).filter(f => f.endsWith('.js')).sort((a, b) => {
+  // vendor chunks 排在前面
+  const aIsVendor = a.startsWith('vendors~');
+  const bIsVendor = b.startsWith('vendors~');
+  if (aIsVendor !== bIsVendor) return aIsVendor ? -1 : 1;
+  return a.localeCompare(b);
+});
+const chunkContents = {};
+for (const file of allJSFiles) {
+  const fullPath = pathUtil.join(jsDir, file);
+  // 跳过主入口文件（已经单独内联）
+  if (pathUtil.resolve(fullPath) === pathUtil.resolve(jsPath)) continue;
+  chunkContents[file] = fs.readFileSync(fullPath, 'utf8');
+  console.log(`chunk: js/${file} (${Buffer.byteLength(chunkContents[file])} bytes)`);
+}
 
 const faviconPath = pathUtil.join(__dirname, '../../static/favicon.ico');
 const faviconData = fs.existsSync(faviconPath) ? fs.readFileSync(faviconPath) : null;
@@ -39,6 +57,10 @@ for (const el of Array.from(document.querySelectorAll('script[type="p4-standalon
   el.remove();
 }
 </script>`;
+// 内联所有 webpack chunks（让动态 import 能找到它们）
+standaloneJS += Object.entries(chunkContents).map(([name, content]) => (
+  `<script data-webpack-chunk="${name}">${makeSafeForInlineScript(content)}</script>`
+)).join('');
 
 let newContent = indexContent;
 if (faviconData) {

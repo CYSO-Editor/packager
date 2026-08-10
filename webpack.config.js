@@ -44,11 +44,22 @@ const makeScaffolding = ({full}) => ({
     'scaffolding-min': './src/scaffolding/export.js'
   },
   resolve: {
+    // scratch-vm lives at ../scratch-vm (a sibling, not an ancestor of node_modules),
+    // so its bare requires (e.g. @turbowarp/scratch-svg-renderer) cannot be resolved by
+    // webpack's default ancestor-walking node_modules lookup. Look in the packager's own
+    // node_modules explicitly.
+    modules: [
+      path.resolve(__dirname, 'node_modules'),
+      'node_modules'
+    ],
     alias: {
       'text-encoding$': path.resolve(__dirname, 'src', 'scaffolding', 'text-encoding'),
       'htmlparser2$': path.resolve(__dirname, 'src', 'scaffolding', 'htmlparser2'),
       'scratch-translate-extension-languages$': path.resolve(__dirname, 'src', 'scaffolding', 'scratch-translate-extension-languages', 'languages.json'),
-      'scratch-parser$': path.resolve(__dirname, 'src', 'scaffolding', 'scratch-parser')
+      'scratch-parser$': path.resolve(__dirname, 'src', 'scaffolding', 'scratch-parser'),
+      // scratch-render-fonts is vendored inside scratch-vm/local-deps and is a peer dep
+      // that npm does not hoist into packager/node_modules; point to it directly.
+      'scratch-render-fonts': path.resolve(__dirname, '../scratch-vm/local-deps/scratch-render-fonts')
     }
   },
   module: {
@@ -58,7 +69,9 @@ const makeScaffolding = ({full}) => ({
         loader: 'babel-loader',
         include: [
           path.resolve(__dirname, 'src'),
-          /node_modules[\\/]scratch-[^\\/]+[\\/]src/
+          /node_modules[\\/]scratch-[^\\/]+[\\/]src/,
+          path.resolve(__dirname, '../scratch-vm/src'),
+          path.resolve(__dirname, '../scratch-vm/local-deps')
         ],
         options: {
           babelrc: false,

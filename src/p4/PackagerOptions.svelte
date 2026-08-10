@@ -54,6 +54,24 @@
   );
   const hasSettingsStoredInProject = hasMagicComment(' // _twconfig_');
 
+  const CYSO_CORE_MAGIC = ' // _cysocore_';
+  const hasCYSOCoreProject = projectData.project.analysis.stageComments.some((text) => {
+    if (typeof text !== 'string') {
+      return false;
+    }
+    const lineWithMagic = text.split('\n').find((line) => line.endsWith(CYSO_CORE_MAGIC));
+    if (!lineWithMagic) {
+      return false;
+    }
+    const jsonText = lineWithMagic.substr(0, lineWithMagic.length - CYSO_CORE_MAGIC.length);
+    try {
+      return !!JSON.parse(jsonText).cysoCoreEnabled;
+    } catch (e) {
+      return false;
+    }
+  });
+  const isElectronTarget = (target) => target.startsWith('electron-');
+
   let result = null;
   let previewer = null;
   const resetResult = () => {
@@ -93,6 +111,10 @@
     'webview-mac',
     'electron-linux64'
   ].includes($options.target);
+
+  $: if (hasCYSOCoreProject && !isElectronTarget($options.target)) {
+    $options.target = 'electron-win32';
+  }
 
   const advancedOptionsInitiallyOpen = (
     $options.compiler.enabled !== defaultOptions.compiler.enabled ||
@@ -181,6 +203,10 @@
   };
 
   const preview = async () => {
+    if (hasCYSOCoreProject) {
+      $error = new Error('CYSO Core 项目仅支持打包为 Electron 程序，无法生成 HTML 预览。');
+      return;
+    }
     resetResult();
     previewer = new Preview();
     const task = new Task();
@@ -796,14 +822,20 @@
 
     <div class="group">
       <label class="option">
-        <input type="radio" name="environment" bind:group={$options.target} value="html">
+        <input type="radio" name="environment" bind:group={$options.target} value="html" disabled={hasCYSOCoreProject}>
         {$_('options.html')}
       </label>
       <label class="option">
-        <input type="radio" name="environment" bind:group={$options.target} value="zip">
+        <input type="radio" name="environment" bind:group={$options.target} value="zip" disabled={hasCYSOCoreProject}>
         {$_('options.zip')}
       </label>
     </div>
+
+    {#if hasCYSOCoreProject}
+      <p class="warning">
+        {$_('options.cysoCoreElectronOnly')}
+      </p>
+    {/if}
 
     <div class="group">
       <label class="option">
@@ -811,7 +843,7 @@
         {$_('options.application-win32').replace('{type}', 'Electron')}
       </label>
       <label class="option">
-        <input type="radio" name="environment" bind:group={$options.target} value="webview-mac">
+        <input type="radio" name="environment" bind:group={$options.target} value="webview-mac" disabled={hasCYSOCoreProject}>
         {$_('options.application-mac').replace('{type}', 'WKWebView')}
       </label>
       <label class="option">
@@ -825,7 +857,7 @@
       <p>{$_('options.otherEnvironmentsHelp')}</p>
       <div class="group">
         <label class="option">
-          <input type="radio" name="environment" bind:group={$options.target} value="zip-one-asset">
+          <input type="radio" name="environment" bind:group={$options.target} value="zip-one-asset" disabled={hasCYSOCoreProject}>
           {$_('options.zip-one-asset')}
         </label>
       </div>
@@ -854,19 +886,19 @@
 
       <div class="group">
         <label class="option">
-          <input type="radio" name="environment" bind:group={$options.target} value="nwjs-win32">
+          <input type="radio" name="environment" bind:group={$options.target} value="nwjs-win32" disabled={hasCYSOCoreProject}>
           {$_('options.application-win32').replace('{type}', 'NW.js')}
         </label>
         <label class="option">
-          <input type="radio" name="environment" bind:group={$options.target} value="nwjs-win64">
+          <input type="radio" name="environment" bind:group={$options.target} value="nwjs-win64" disabled={hasCYSOCoreProject}>
           {$_('options.application-win64').replace('{type}', 'NW.js')}
         </label>
         <label class="option">
-          <input type="radio" name="environment" bind:group={$options.target} value="nwjs-mac">
+          <input type="radio" name="environment" bind:group={$options.target} value="nwjs-mac" disabled={hasCYSOCoreProject}>
           {$_('options.application-mac').replace('{type}', 'NW.js')}
         </label>
         <label class="option">
-          <input type="radio" name="environment" bind:group={$options.target} value="nwjs-linux-x64">
+          <input type="radio" name="environment" bind:group={$options.target} value="nwjs-linux-x64" disabled={hasCYSOCoreProject}>
           {$_('options.application-linux64').replace('{type}', 'NW.js')}
         </label>
       </div>

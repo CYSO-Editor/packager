@@ -176,6 +176,9 @@
     "storedWarning": {
       "string": "Note: This project has settings stored in it, which may override these settings."
     },
+    "cysoCoreElectronOnly": {
+      "string": "This is a CYSO Core project. It can only be packaged as an Electron application (EXE / APP / Linux). HTML / Zip / NW.js / WKWebView are disabled."
+    },
     "turbo": {
       "string": "Turbo Mode"
     },

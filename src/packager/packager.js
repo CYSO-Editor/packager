@@ -547,6 +547,13 @@ cd "$(dirname "$0")"
     let mainJS = `'use strict';
 const {app, BrowserWindow, Menu, shell, screen, dialog, ipcMain} = require('electron');
 const path = require('path');
+const fs = require('fs');
+
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+
+const __CYSO_CONFIG__ = ${JSON.stringify(this._cysoConfig || { cysoCoreEnabled: false, extensionPermissions: {} })};
 
 const isWindows = process.platform === 'win32';
 const isMac = process.platform === 'darwin';
@@ -568,6 +575,8 @@ const resourcesURL = Object.assign(new URL('file://'), {
   pathname: path.join(__dirname, '/')
 }).href;
 const defaultProjectURL = new URL('./index.html', resourcesURL).href;
+
+let mainWindow = null;
 
 const createWindow = (windowOptions) => {
   const options = {
@@ -612,6 +621,13 @@ const createProjectWindow = (url) => {
     options.fullscreen = true;
   }
   const window = createWindow(options);
+  mainWindow = window;
+  mainWindow.on('closed', () => {
+    for (const ov of overlayWindows.values()) {
+      if (!ov.isDestroyed()) ov.close();
+    }
+    overlayWindows.clear();
+  });
   if (windowMode === 'maximize') {
     window.maximize();
   }
@@ -750,13 +766,914 @@ app.on('window-all-closed', () => {
   app.quit();
 });
 
+let cysoPermissions = {};
+let extNameMap = {};
+let cysoCoreEnabled = false;
+let permissionsLoaded = false;
+
+const initPermissions = () => {
+  if (!permissionsLoaded) {
+    const __cfg = (typeof __CYSO_CONFIG__ !== 'undefined' && __CYSO_CONFIG__) || {};
+    cysoPermissions = __cfg.extensionPermissions || {};
+    cysoCoreEnabled = !!__cfg.cysoCoreEnabled;
+    permissionsLoaded = true;
+  }
+};
+
+const getRiskPaths = () => {
+  const riskPaths = {
+    windows: [
+      'C:\\\\Windows',
+      'C:\\\\Program Files',
+      'C:\\\\Program Files (x86)',
+      'C:\\\\ProgramData',
+      'C:\\\\Users\\\\All Users',
+      'C:\\\\$Recycle.Bin',
+      'C:\\\\System Volume Information',
+      'C:\\\\Boot',
+      'C:\\\\EFI'
+    ],
+    unix: [
+      '/bin', '/sbin', '/usr/bin', '/usr/sbin',
+      '/etc', '/var', '/root', '/boot', '/efi',
+      '/System', '/Library', '/Applications'
+    ]
+  };
+  return riskPaths;
+};
+
+const getUserSafePaths = () => {
+  return [
+    'documents', 'desktop', 'downloads', 'pictures', 
+    'music', 'videos', 'userData', 'appData', 'temp'
+  ];
+};
+
+const isPathSafe = (filePath, app) => {
+  try {
+    const normalizedPath = path.resolve(filePath).toLowerCase();
+    const riskPaths = isWindows ? getRiskPaths().windows : getRiskPaths().unix;
+    const safePathNames = getUserSafePaths();
+    const safePaths = safePathNames.map(name => {
+      try { return app.getPath(name); } catch { return null; }
+    }).filter(p => p);
+    
+    for (const riskPath of riskPaths) {
+      if (riskPath && normalizedPath.startsWith(riskPath.toLowerCase())) {
+        for (const safePath of safePaths) {
+          if (safePath && normalizedPath.startsWith(safePath.toLowerCase())) {
+            return true;
+          }
+        }
+        return false;
+      }
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+};
+
+const expandPath = (filePath, app) => {
+  if (typeof filePath !== 'string' || filePath.length === 0) {
+    return filePath;
+  }
+  let result = filePath;
+  result = result.replace(/%([^%]+)%/g, (match, name) => {
+    const lower = name.toLowerCase();
+    const safeNames = getUserSafePaths();
+    if (safeNames.includes(lower)) {
+      try {
+        return app.getPath(lower);
+      } catch (e) {
+        // 回退到系统环境变量
+      }
+    }
+    if (process.env[name] != null) return process.env[name];
+    const upper = name.toUpperCase();
+    if (process.env[upper] != null) return process.env[upper];
+    return match;
+  });
+  if (!isWindows) {
+    result = result.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (match, name) => {
+      if (process.env[name] != null) return process.env[name];
+      return match;
+    });
+  }
+  return result;
+};
+
+const DANGEROUS_COMMANDS = {
+  blocked: [
+    /rm\\s+-rf\\s+\\//i,
+    /rm\\s+-rf\\s+\\\\/,
+    /del\\s+\\/[sS]/i,
+    /format\\s+[a-z]:/i,
+    /fdisk/i,
+    /mkfs/i,
+    /dd\\s+if=/i,
+    /reg\\s+(add|delete|import)/i,
+    /bcdedit/i,
+    /bootcfg/i,
+    /diskpart/i,
+    /powershell.*-executionpolicy\\s+bypass/i,
+    /net\\s+(user|localgroup|group)\\s+(add|delete)/i,
+    /sudo\\s+/i,
+    /runas\\s+/i,
+    /su\\s+/i,
+    /sc\\s+(create|delete|config)/i,
+    /net\\s+(start|stop)\\s+/i,
+    /systemctl\\s+(enable|disable|start|stop)/i,
+    /netsh\\s+/i,
+    /iptables/i,
+    /route\\s+(add|delete)/i,
+    /taskkill\\s+\\/f/i,
+    /kill\\s+-9/i,
+    /pkill\\s+-9/i,
+    /icacls\\s+/i,
+    /chmod\\s+777/i,
+    /chown\\s+/i,
+    /\\-EncodedCommand/i,
+    /Invoke-Expression/i,
+    /\\biex\\b/i,
+    /Start-Process\\s+-Verb\\s+RunAs/i,
+    /\\[System\\.Convert\\]::FromBase64String/i,
+    /Set-ExecutionPolicy/i,
+    /New-Object\\s+System\\.Diagnostics\\.ProcessStartInfo/i
+  ],
+  warning: [
+    /npm\\s+(install|uninstall)/i,
+    /pip\\s+(install|uninstall)/i,
+    /apt(-get)?\\s+(install|remove)/i,
+    /yum\\s+(install|remove)/i,
+    /winget\\s+/i,
+    /choco\\s+/i
+  ]
+};
+
+const RISK_LEVELS = { LOW: 1, MEDIUM: 2, HIGH: 3 };
+
+const PERMISSION_GROUPS = {
+  FILE_OPS: { id: 'cysoFileOps', name: '文件操作', permissions: {
+    'file-read': { defaultSetting: 'ask', riskLevel: RISK_LEVELS.LOW },
+    'file-write': { defaultSetting: 'ask', riskLevel: RISK_LEVELS.MEDIUM },
+    'file-delete': { defaultSetting: 'ask', riskLevel: RISK_LEVELS.HIGH },
+    'file-metadata': { defaultSetting: 'ask', riskLevel: RISK_LEVELS.LOW }
+  }},
+  SYSTEM_OPS: { id: 'cysoSystemOps', name: '系统操作', permissions: {
+    'system-command': { defaultSetting: 'deny', riskLevel: RISK_LEVELS.HIGH },
+    'global-shortcut': { defaultSetting: 'ask', riskLevel: RISK_LEVELS.MEDIUM }
+  }},
+  UI_OPS: { id: 'cysoUiOps', name: '界面操作', permissions: {
+    'draw-window': { defaultSetting: 'ask', riskLevel: RISK_LEVELS.MEDIUM },
+    'screen-capture': { defaultSetting: 'ask', riskLevel: RISK_LEVELS.HIGH },
+    'advanced-window': { defaultSetting: 'ask', riskLevel: RISK_LEVELS.MEDIUM }
+  }},
+  HARDWARE_OPS: { id: 'cysoHardwareOps', name: '硬件操作', permissions: {
+    'hardware-status': { defaultSetting: 'ask', riskLevel: RISK_LEVELS.LOW }
+  }}
+};
+
+const getDefaultPermissionSetting = (permissionType) => {
+  for (const group of Object.values(PERMISSION_GROUPS)) {
+    if (group.permissions[permissionType]) {
+      return group.permissions[permissionType].defaultSetting;
+    }
+  }
+  return 'ask';
+};
+
+const RISK_INFO = {
+  'system-command': { level: 3, name: '执行命令', risk: '高风险 - 可以执行系统命令（禁止危险命令）' },
+  'file-write': { level: 2, name: '写入文件', risk: '中风险 - 可以修改或创建文件（仅安全路径）' },
+  'file-delete': { level: 3, name: '删除文件', risk: '高风险 - 可以删除文件（仅安全路径）' },
+  'file-read': { level: 1, name: '读取文件', risk: '低风险 - 可以读取文件内容' },
+  'file-metadata': { level: 1, name: '获取文件元数据', risk: '低风险 - 读取文件信息，不修改文件' },
+  'global-shortcut': { level: 2, name: '全局快捷键', risk: '中风险 - 可以注册全局快捷键监听按键' },
+  'draw-window': { level: 2, name: '屏幕绘制窗口', risk: '中风险 - 可以在屏幕上绘制覆盖层' },
+  'screen-capture': { level: 3, name: '屏幕/窗口捕获', risk: '高风险 - 可以捕获屏幕内容' },
+  'advanced-window': { level: 2, name: '高级窗口', risk: '中风险 - 可以创建特殊窗口' },
+  'hardware-status': { level: 1, name: '读取硬件状态', risk: '低风险 - 只读硬件状态信息' }
+};
+
+const _checkPermission = async (extensionId, permissionType) => {
+  initPermissions();
+  const permInfo = RISK_INFO[permissionType] || { level: 1, name: permissionType, risk: '未知风险' };
+
+  if (!extensionId) {
+    if (cysoCoreEnabled) {
+      return { allowed: false, reason: 'no-extension-context', action: 'deny', notRequested: true };
+    }
+    return { allowed: true, reason: 'app', action: 'allow' };
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(cysoPermissions[extensionId] || {}, permissionType)) {
+    return { allowed: false, reason: 'not-requested', action: 'deny', notRequested: true };
+  }
+  const setting = cysoPermissions[extensionId]?.[permissionType];
+  if (setting === 'always') {
+    return { allowed: true, reason: 'always', action: 'allow' };
+  }
+  if (setting === 'deny') {
+    return { allowed: false, reason: 'deny', action: 'deny' };
+  }
+  
+  const showPermissionDialog = async () => {
+    const window = mainWindow || BrowserWindow.getFocusedWindow();
+    if (!window) {
+      return { allowed: false, reason: 'no-window', action: 'deny' };
+    }
+    try {
+      const result = await dialog.showMessageBox(window, {
+        type: 'question',
+        buttons: ['拒绝', '允许'],
+        defaultId: 0,
+        cancelId: 0,
+        title: 'CYSO 权限请求',
+        message: \`扩展「\${extNameMap[extensionId] || extensionId}」(\${extensionId}) 请求使用权限：\`,
+        detail: \`权限类型: \${permInfo.name}\\n风险等级: \${permInfo.level === 3 ? '高' : permInfo.level === 2 ? '中' : '低'}\\n\${permInfo.risk}\\n\\n是否允许此操作?\`
+      });
+      if (result.response === 1) {
+        // 记住用户的允许选择，避免同一会话内对同一权限反复弹窗（与编辑器 CYSOCore 行为一致）
+        cysoPermissions[extensionId] = Object.assign({}, cysoPermissions[extensionId], { [permissionType]: 'always' });
+        return { allowed: true, reason: 'user-allowed', action: 'allow' };
+      }
+      return { allowed: false, reason: 'user-denied', action: 'deny' };
+    } catch (e) {
+      console.error('Permission dialog error:', e);
+      return { allowed: false, reason: 'error', action: 'deny' };
+    }
+  };
+  
+  return await showPermissionDialog();
+};
+
+ipcMain.handle('register-extension-permissions', async (event, extensionId, requestedPermissions, extensionName) => {
+  initPermissions();
+  if (extensionId && extensionName) {
+    extNameMap[extensionId] = extensionName;
+  }
+  if (extensionId && !(cysoPermissions && cysoPermissions[extensionId])) {
+    const seeded = {};
+    const requestedValid = (Array.isArray(requestedPermissions) ? requestedPermissions : []).filter((p) => RISK_INFO[p]);
+    for (const p of requestedValid) {
+      seeded[p] = getDefaultPermissionSetting(p);
+    }
+    cysoPermissions = Object.assign({}, cysoPermissions, { [extensionId]: seeded });
+  }
+  return { success: true, permissions: (cysoPermissions && cysoPermissions[extensionId]) || {}, pruned: [], requested: requestedPermissions, message: '已加载扩展 ' + (extensionId || '') + ' 的权限配置' };
+});
+
+ipcMain.handle('get-permissions', () => cysoPermissions);
+ipcMain.handle('set-permissions', (event, permissions) => {
+  cysoPermissions = permissions || {};
+  return { success: true };
+});
+ipcMain.handle('get-cyso-core-enabled', () => cysoCoreEnabled);
+ipcMain.handle('set-cyso-core-enabled', (event, enabled) => {
+  cysoCoreEnabled = !!enabled;
+  return { success: true };
+});
+ipcMain.handle('check-permission', async (event, extensionId, permissionType) => {
+  return await _checkPermission(extensionId, permissionType);
+});
+
+const fsPromises = require('fs').promises;
+
+ipcMain.handle('read-file', async (event, extensionId, filePath) => {
+  filePath = expandPath(filePath, app);
+  const checkResult = await _checkPermission(extensionId, 'file-read');
+  if (!checkResult || checkResult.action !== 'allow') {
+    return { success: false, error: 'Permission denied: file-read' };
+  }
+  if (!isPathSafe(filePath, app)) {
+    return { success: false, error: '安全限制：不允许读取系统关键路径或风险路径下的文件' };
+  }
+  try {
+    const content = await fsPromises.readFile(filePath, 'utf-8');
+    return { success: true, content };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('write-file', async (event, extensionId, filePath, content) => {
+  filePath = expandPath(filePath, app);
+  const checkResult = await _checkPermission(extensionId, 'file-write');
+  if (!checkResult || checkResult.action !== 'allow') {
+    return { success: false, error: 'Permission denied: file-write' };
+  }
+  if (!isPathSafe(filePath, app)) {
+    return { success: false, error: '安全限制：不允许写入系统关键路径或风险路径' };
+  }
+  try {
+    // 确保 content 是正确的类型：string | Buffer | TypedArray
+    let processedContent = content;
+    if (content === null || content === undefined) {
+      processedContent = '';
+    } else if (typeof content === 'number' || typeof content === 'boolean') {
+      processedContent = String(content);
+    } else if (typeof content !== 'string' && !Buffer.isBuffer(content) && !(content instanceof Uint8Array)) {
+      // ArrayBuffer 或其他类型转换为 Uint8Array
+      if (content instanceof ArrayBuffer) {
+        processedContent = new Uint8Array(content);
+      } else {
+        // 其他情况尝试转为字符串
+        processedContent = String(content);
+      }
+    }
+    await fsPromises.writeFile(filePath, processedContent, 'utf-8');
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('delete-file', async (event, extensionId, filePath) => {
+  filePath = expandPath(filePath, app);
+  const checkResult = await _checkPermission(extensionId, 'file-delete');
+  if (!checkResult || checkResult.action !== 'allow') {
+    return { success: false, error: 'Permission denied: file-delete' };
+  }
+  if (!isPathSafe(filePath, app)) {
+    return { success: false, error: '安全限制：不允许删除系统关键路径或风险路径下的文件' };
+  }
+  try {
+    await fsPromises.unlink(filePath);
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('file-exists', async (event, extensionId, filePath) => {
+  filePath = expandPath(filePath, app);
+  const checkResult = await _checkPermission(extensionId, 'file-metadata');
+  if (!checkResult || checkResult.action !== 'allow') {
+    return { success: false, error: 'Permission denied: file-metadata' };
+  }
+  if (!isPathSafe(filePath, app)) {
+    return { success: false, error: '安全限制：不允许检查系统关键路径或风险路径下的文件' };
+  }
+  try {
+    await fsPromises.access(filePath);
+    return { success: true, exists: true };
+  } catch {
+    return { success: true, exists: false };
+  }
+});
+
+ipcMain.handle('get-file-stats', async (event, extensionId, filePath) => {
+  filePath = expandPath(filePath, app);
+  const checkResult = await _checkPermission(extensionId, 'file-metadata');
+  if (!checkResult || checkResult.action !== 'allow') {
+    return { success: false, error: 'Permission denied: file-metadata' };
+  }
+  if (!isPathSafe(filePath, app)) {
+    return { success: false, error: '安全限制：不允许获取系统关键路径或风险路径下的文件信息' };
+  }
+  try {
+    const stats = await fsPromises.stat(filePath);
+    return { 
+      success: true, 
+      stats: {
+        size: stats.size,
+        isFile: stats.isFile(),
+        isDirectory: stats.isDirectory(),
+        created: stats.birthtime,
+        modified: stats.mtime,
+        accessed: stats.atime
+      }
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('create-folder', async (event, extensionId, folderPath) => {
+  folderPath = expandPath(folderPath, app);
+  const checkResult = await _checkPermission(extensionId, 'file-write');
+  if (!checkResult || checkResult.action !== 'allow') {
+    return { success: false, error: 'Permission denied: file-write' };
+  }
+  if (!isPathSafe(folderPath, app)) {
+    return { success: false, error: '安全限制：不允许在系统关键路径或风险路径下创建文件夹' };
+  }
+  try {
+    await fsPromises.mkdir(folderPath, { recursive: true });
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('read-local-folder', async (event, extensionId, folderPath) => {
+  folderPath = expandPath(folderPath, app);
+  const checkResult = await _checkPermission(extensionId, 'file-read');
+  if (!checkResult || checkResult.action !== 'allow') {
+    return { success: false, error: 'Permission denied: file-read' };
+  }
+  if (!isPathSafe(folderPath, app)) {
+    return { success: false, error: '安全限制：不允许读取系统关键路径或风险路径下的文件夹' };
+  }
+  try {
+    const entries = await fsPromises.readdir(folderPath, { withFileTypes: true });
+    return {
+      success: true,
+      files: entries.map(entry => ({
+        name: entry.name,
+        isFile: entry.isFile(),
+        isDirectory: entry.isDirectory()
+      }))
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('execute-command', async (event, extensionId, command, options) => {
+  command = expandPath(command, app);
+  if (options && typeof options.cwd === 'string') {
+    options.cwd = expandPath(options.cwd, app);
+  }
+  const checkResult = await _checkPermission(extensionId, 'system-command');
+  if (!checkResult || checkResult.action !== 'allow') {
+    return { success: false, error: 'Permission denied: system-command' };
+  }
+  
+  for (const pattern of DANGEROUS_COMMANDS.blocked) {
+    if (pattern.test(command)) {
+      console.warn('Blocked dangerous command:', command);
+      return { success: false, error: '安全限制：禁止执行可能危害系统的命令' };
+    }
+  }
+  
+  try {
+    const { exec } = require('child_process');
+    const { promisify } = require('util');
+    const execAsync = promisify(exec);
+    const { stdout, stderr } = await execAsync(command, options || {});
+    return { success: true, stdout, stderr };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+const { globalShortcut } = require('electron');
+const registeredShortcuts = new Map();
+
+ipcMain.handle('register-global-shortcut', async (event, extensionId, key, eventName) => {
+  const checkResult = await _checkPermission(extensionId, 'global-shortcut');
+  if (!checkResult || checkResult.action !== 'allow') {
+    return { success: false, error: 'Permission denied: global-shortcut' };
+  }
+  try {
+    if (registeredShortcuts.has(key)) {
+      globalShortcut.unregister(key);
+    }
+    const senderWindow = BrowserWindow.fromWebContents(event.sender);
+    const success = globalShortcut.register(key, () => {
+      if (senderWindow && !senderWindow.isDestroyed()) {
+        senderWindow.webContents.send('global-shortcut-triggered', { key, eventName });
+      }
+    });
+    if (success) {
+      registeredShortcuts.set(key, eventName);
+      return { success: true };
+    }
+    return { success: false, error: 'Failed to register shortcut' };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('unregister-global-shortcut', async (event, key) => {
+  try {
+    if (registeredShortcuts.has(key)) {
+      globalShortcut.unregister(key);
+      registeredShortcuts.delete(key);
+    }
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+const overlayWindows = new Map();
+
+ipcMain.handle('create-overlay-window', async (event, extensionId, id, x, y, w, h) => {
+  const checkResult = await _checkPermission(extensionId, 'draw-window');
+  if (!checkResult || checkResult.action !== 'allow') {
+    return { success: false, error: 'Permission denied: draw-window' };
+  }
+
+  try {
+    if (overlayWindows.has(id)) {
+      overlayWindows.get(id).close();
+    }
+
+    const width = Math.max(1, Math.round(w));
+    const height = Math.max(1, Math.round(h));
+
+    const overlay = new BrowserWindow({
+      x: Math.round(x),
+      y: Math.round(y),
+      width,
+      height,
+      frame: false,
+      transparent: true,
+      backgroundColor: '#00000000',
+      alwaysOnTop: true,
+      skipTaskbar: true,
+      resizable: false,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true
+      }
+    });
+
+    await overlay.loadURL('data:text/html;base64,' + Buffer.from(
+      '<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;overflow:hidden;background:transparent;"></body></html>',
+      'utf-8'
+    ).toString('base64'));
+
+    overlay.setFocusable(false);
+    overlay.on('closed', () => overlayWindows.delete(id));
+
+    overlayWindows.set(id, overlay);
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('set-overlay-content', async (event, extensionId, id, content) => {
+  try {
+    const overlay = overlayWindows.get(id);
+    if (!overlay) {
+      return { success: false, error: 'Overlay window not found' };
+    }
+
+    let processed = typeof content === 'string' ? content : String(content == null ? '' : content);
+    if (/^\s*[\d.]+\s*$/.test(processed) && !/<|>|script/i.test(processed)) {
+      processed = '<pre>' + processed + '</pre>';
+    }
+
+    const baseStyle =
+      '<style>html,body{height:100%!important;width:100%!important;margin:0!important;' +
+      'padding:0!important;overflow:hidden!important;background:transparent!important;}</style>';
+
+    const headIdx = processed.toLowerCase().indexOf('</head>');
+    if (headIdx !== -1) {
+      processed = processed.slice(0, headIdx) + baseStyle + processed.slice(headIdx);
+    } else if (processed.toLowerCase().indexOf('<head') !== -1) {
+      const hIdx = processed.toLowerCase().indexOf('<head');
+      const hEnd = processed.indexOf('>', hIdx);
+      processed = processed.slice(0, hEnd + 1) + baseStyle + processed.slice(hEnd + 1);
+    } else if (processed.toLowerCase().indexOf('<html') !== -1) {
+      const htmlIdx = processed.toLowerCase().indexOf('<html');
+      const htmlEnd = processed.indexOf('>', htmlIdx);
+      processed = processed.slice(0, htmlEnd + 1) + '<head>' + baseStyle + '</head>' + processed.slice(htmlEnd + 1);
+    } else {
+      processed = '<!DOCTYPE html><html><head>' + baseStyle + '</head><body>' + processed + '</body></html>';
+    }
+
+    await overlay.webContents.executeJavaScript(
+      'document.open();document.write(' + JSON.stringify(processed) + ');document.close();'
+    );
+
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('close-overlay-window', async (event, id) => {
+  try {
+    const overlay = overlayWindows.get(id);
+    if (overlay) {
+      overlay.close();
+      overlayWindows.delete(id);
+    }
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+const advancedWindows = new Map();
+
+ipcMain.handle('create-advanced-window', async (event, extensionId, id, options) => {
+  const checkResult = await _checkPermission(extensionId, 'advanced-window');
+  if (!checkResult || checkResult.action !== 'allow') {
+    return { success: false, error: 'Permission denied: advanced-window' };
+  }
+
+  try {
+    if (advancedWindows.has(id)) {
+      const existing = advancedWindows.get(id);
+      if (existing && !existing.isDestroyed()) {
+        existing.close();
+      }
+      advancedWindows.delete(id);
+    }
+
+    const windowOptions = {
+      width: options.width || 400,
+      height: options.height || 300,
+      frame: !options.frameless,
+      transparent: options.transparent || false,
+      alwaysOnTop: options.alwaysOnTop || false,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true
+      }
+    };
+
+    if (options.x !== undefined) windowOptions.x = options.x;
+    if (options.y !== undefined) windowOptions.y = options.y;
+
+    const win = new BrowserWindow(windowOptions);
+    win.on('closed', () => {
+      if (advancedWindows.get(id) === win) {
+        advancedWindows.delete(id);
+      }
+    });
+    win.loadURL(options.url || 'about:blank');
+
+    advancedWindows.set(id, win);
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('set-window-property', async (event, id, prop, value) => {
+  try {
+    const win = advancedWindows.get(id);
+    if (!win || win.isDestroyed()) {
+      return { success: false, error: 'Window not found' };
+    }
+
+    switch (prop) {
+      case 'alwaysOnTop':
+        win.setAlwaysOnTop(value);
+        break;
+      case 'clickThrough':
+        win.setIgnoreMouseEvents(value);
+        break;
+      case 'draggable':
+        win.setMovable(value);
+        break;
+      default:
+        return { success: false, error: \`Unknown property: \${prop}\` };
+    }
+
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('close-advanced-window', async (event, id) => {
+  try {
+    const win = advancedWindows.get(id);
+    if (win) {
+      if (!win.isDestroyed()) {
+        win.close();
+      }
+      advancedWindows.delete(id);
+    }
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('capture-screen', async (event, extensionId, target) => {
+  const checkResult = await _checkPermission(extensionId, 'screen-capture');
+  if (!checkResult || checkResult.action !== 'allow') {
+    return { success: false, error: 'Permission denied: screen-capture' };
+  }
+  try {
+    const { desktopCapturer } = require('electron');
+    const sources = await desktopCapturer.getSources({ 
+      types: target === 'window' ? ['window'] : ['screen'] 
+    });
+    if (sources.length === 0) {
+      return { success: false, error: 'No capture sources found' };
+    }
+    const source = sources[0];
+    const image = source.thumbnail.toDataURL();
+    return { success: true, dataUrl: image };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('capture-region', async (event, extensionId, x, y, w, h) => {
+  const checkResult = await _checkPermission(extensionId, 'screen-capture');
+  if (!checkResult || checkResult.action !== 'allow') {
+    return { success: false, error: 'Permission denied: screen-capture' };
+  }
+  try {
+    const { desktopCapturer, nativeImage } = require('electron');
+    const sources = await desktopCapturer.getSources({ types: ['screen'] });
+    if (sources.length === 0) {
+      return { success: false, error: 'No screen found' };
+    }
+    const img = nativeImage.createFromDataURL(sources[0].thumbnail.toDataURL());
+    const cropped = img.crop({ x, y, width: w, height: h });
+    return { success: true, dataUrl: cropped.toDataURL() };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('show-notification', async (event, options) => {
+  try {
+    const { Notification } = require('electron');
+    if (!Notification.isSupported()) {
+      return { success: false, error: 'Notifications not supported' };
+    }
+    const notification = new Notification({
+      title: options.title || 'CYSOEditor',
+      body: options.body || '',
+      icon: options.icon || null
+    });
+    notification.show();
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('get-path', async (event, name) => {
+  try {
+    return { success: true, path: app.getPath(name) };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+const getDiskUsage = async () => {
+  try {
+    const { execSync } = require('child_process');
+    if (process.platform === 'win32') {
+      const result = execSync(
+        \`powershell -Command "Get-PSDrive C | Select-Object Used,Free,@{N='Total';E={\$_.Used+\$_.Free}} | ConvertTo-Json"\`,
+        { encoding: 'utf-8', timeout: 5000 }
+      ).trim();
+      const info = JSON.parse(result);
+      return {
+        used: info.Used || 0,
+        free: info.Free || 0,
+        total: info.Total || 0
+      };
+    } else {
+      const result = execSync(
+        \`df -k / | tail -1\`,
+        { encoding: 'utf-8', timeout: 5000 }
+      ).trim().split(/\\s+/);
+      return {
+        used: parseInt(result[2]) * 1024 || 0,
+        free: parseInt(result[3]) * 1024 || 0,
+        total: parseInt(result[1]) * 1024 || 0
+      };
+    }
+  } catch (e) {
+    return { used: 0, free: 0, total: 0 };
+  }
+};
+
+ipcMain.handle('get-hardware-status', async (event, extensionId, device) => {
+  const checkResult = await _checkPermission(extensionId, 'hardware-status');
+  if (!checkResult || checkResult.action !== 'allow') {
+    return { success: false, error: 'Permission denied: hardware-status' };
+  }
+
+  try {
+    const os = require('os');
+    const data = {};
+
+    switch (device) {
+      case 'cpu': {
+        const cpus = os.cpus();
+        const cpuUsage = process.cpuUsage();
+        data.usage = Math.round((cpuUsage.user / (cpuUsage.user + cpuUsage.system)) * 100) || 0;
+        data.model = cpus[0]?.model || 'Unknown';
+        data.cores = cpus.length;
+        data.speed = cpus[0]?.speed || 0;
+        break;
+      }
+
+      case 'memory': {
+        const totalMem = os.totalmem();
+        const freeMem = os.freemem();
+        data.total = totalMem;
+        data.free = freeMem;
+        data.used = totalMem - freeMem;
+        data.usage = Math.round(((totalMem - freeMem) / totalMem) * 100);
+        break;
+      }
+
+      case 'gpu': {
+        data.info = 'GPU info requires additional native modules';
+        break;
+      }
+
+      case 'network': {
+        const networkInterfaces = os.networkInterfaces();
+        data.interfaces = Object.keys(networkInterfaces);
+        break;
+      }
+
+      case 'disk': {
+        Object.assign(data, await getDiskUsage());
+        break;
+      }
+
+      default:
+        return { success: false, error: \`Unknown device: \${device}\` };
+    }
+
+    return { success: true, data };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
 app.whenReady().then(() => {
+  initPermissions();
   createProjectWindow(defaultProjectURL);
 });
 `;
 
     let preloadJS = `'use strict';
 const {contextBridge, ipcRenderer} = require('electron');
+
+let activeExtensionStack = [];
+let activeExtensionId = null;
+const getActiveExtensionId = () => {
+  if (activeExtensionStack.length) {
+    return activeExtensionStack[activeExtensionStack.length - 1];
+  }
+  return activeExtensionId;
+};
+
+contextBridge.exposeInMainWorld('EditorPreload', {
+  getPermissions: () => ipcRenderer.invoke('get-permissions'),
+  setPermissions: (permissions) => ipcRenderer.invoke('set-permissions', permissions),
+  checkPermission: (extensionId, permissionType) => ipcRenderer.invoke('check-permission', extensionId, permissionType),
+  getCYSOCoreEnabled: () => ipcRenderer.invoke('get-cyso-core-enabled'),
+  setCYSOCoreEnabled: (enabled) => ipcRenderer.invoke('set-cyso-core-enabled', enabled),
+  registerExtensionPermissions: (extensionId, requestedPermissions, extensionName) => ipcRenderer.invoke('register-extension-permissions', extensionId, requestedPermissions, extensionName),
+
+  setActiveExtensionId: (id) => { activeExtensionId = id || null; },
+  pushActiveExtensionId: (id) => {
+    activeExtensionStack.push(id);
+    activeExtensionId = id;
+  },
+  popActiveExtensionId: () => {
+    activeExtensionStack.pop();
+    activeExtensionId = activeExtensionStack.length ? activeExtensionStack[activeExtensionStack.length - 1] : null;
+  },
+
+  readFile: (filePath) => ipcRenderer.invoke('read-file', getActiveExtensionId(), filePath),
+  writeFile: (filePath, content) => ipcRenderer.invoke('write-file', getActiveExtensionId(), filePath, content),
+  deleteFile: (filePath) => ipcRenderer.invoke('delete-file', getActiveExtensionId(), filePath),
+  fileExists: (filePath) => ipcRenderer.invoke('file-exists', getActiveExtensionId(), filePath),
+  getFileStats: (filePath) => ipcRenderer.invoke('get-file-stats', getActiveExtensionId(), filePath),
+  createFolder: (folderPath) => ipcRenderer.invoke('create-folder', getActiveExtensionId(), folderPath),
+  readLocalFolder: (folderPath) => ipcRenderer.invoke('read-local-folder', getActiveExtensionId(), folderPath),
+
+  executeCommand: (command, options) => ipcRenderer.invoke('execute-command', getActiveExtensionId(), command, options),
+
+  registerGlobalShortcut: (key, eventName) => ipcRenderer.invoke('register-global-shortcut', getActiveExtensionId(), key, eventName),
+  unregisterGlobalShortcut: (key) => ipcRenderer.invoke('unregister-global-shortcut', key),
+  onShortcutTriggered: (callback) => {
+    const handler = (event, data) => callback(data);
+    ipcRenderer.on('global-shortcut-triggered', handler);
+    return () => ipcRenderer.removeListener('global-shortcut-triggered', handler);
+  },
+
+  createOverlayWindow: (id, x, y, w, h) => ipcRenderer.invoke('create-overlay-window', getActiveExtensionId(), id, x, y, w, h),
+  setOverlayContent: (id, content) => ipcRenderer.invoke('set-overlay-content', getActiveExtensionId(), id, content),
+  closeOverlayWindow: (id) => ipcRenderer.invoke('close-overlay-window', id),
+
+  createAdvancedWindow: (id, options) => ipcRenderer.invoke('create-advanced-window', getActiveExtensionId(), id, options),
+  setWindowProperty: (id, prop, value) => ipcRenderer.invoke('set-window-property', getActiveExtensionId(), id, prop, value),
+  closeAdvancedWindow: (id) => ipcRenderer.invoke('close-advanced-window', id),
+
+  captureScreen: (target) => ipcRenderer.invoke('capture-screen', getActiveExtensionId(), target),
+  captureRegion: (x, y, w, h) => ipcRenderer.invoke('capture-region', getActiveExtensionId(), x, y, w, h),
+
+  getHardwareStatus: (device) => ipcRenderer.invoke('get-hardware-status', getActiveExtensionId(), device),
+
+  showNotification: (options) => ipcRenderer.invoke('show-notification', options),
+
+  getPath: (name) => ipcRenderer.invoke('get-path', name)
+});
 `;
 
     if (
@@ -1231,6 +2148,61 @@ cd "$(dirname "$0")"
     return finalURLs;
   }
 
+  async extractCYSOConfig () {
+    const MAGIC = ' // _cysocore_';
+    try {
+      const data = this.project && this.project.arrayBuffer;
+      if (!data) {
+        return { cysoCoreEnabled: false, extensionPermissions: {} };
+      }
+      let projectJSON = null;
+      try {
+        const JSZip = await getJSZip();
+        const zip = await JSZip.loadAsync(data);
+        const file = zip.file('project.json');
+        if (file) {
+          projectJSON = JSON.parse(await file.async('string'));
+        }
+      } catch (e) {
+      }
+      if (!projectJSON) {
+        try {
+          const text = (typeof data === 'string') ? data : new TextDecoder().decode(data);
+          projectJSON = JSON.parse(text);
+        } catch (e) {
+          return { cysoCoreEnabled: false, extensionPermissions: {} };
+        }
+      }
+      const targets = (projectJSON && projectJSON.targets) || [];
+      const stage = targets.find((t) => t.isStage);
+      if (!stage || !stage.comments) {
+        return { cysoCoreEnabled: false, extensionPermissions: {} };
+      }
+      for (const comment of Object.values(stage.comments)) {
+        const text = (comment && comment.text) || '';
+        if (text.includes(MAGIC)) {
+          const lineWithMagic = text.split('\n').find((line) => line.endsWith(MAGIC));
+          if (!lineWithMagic) {
+            return { cysoCoreEnabled: false, extensionPermissions: {} };
+          }
+          const jsonText = lineWithMagic.substr(0, lineWithMagic.length - MAGIC.length);
+          try {
+            const parsed = JSON.parse(jsonText);
+            return {
+              cysoCoreEnabled: !!parsed.cysoCoreEnabled,
+              extensionPermissions: parsed.extensionPermissions || {}
+            };
+          } catch (e) {
+            return { cysoCoreEnabled: false, extensionPermissions: {} };
+          }
+        }
+      }
+      return { cysoCoreEnabled: false, extensionPermissions: {} };
+    } catch (e) {
+      return { cysoCoreEnabled: false, extensionPermissions: {} };
+    }
+  }
+
   async package () {
     if (!Adapter) {
       throw new Error('Missing adapter');
@@ -1240,6 +2212,11 @@ cd "$(dirname "$0")"
     }
     this.used = true;
     this.ensureNotAborted();
+    const cysoConfig = await this.extractCYSOConfig();
+    this._cysoConfig = cysoConfig;
+    if (cysoConfig.cysoCoreEnabled && !this.options.target.startsWith('electron-')) {
+      throw new Error('CYSO Core 项目仅支持打包为 Electron 程序（EXE / APP / Linux），不支持 HTML / ZIP 等其他格式。');
+    }
     await this.loadResources();
     this.ensureNotAborted();
     const html = encodeBigString`<!DOCTYPE html>

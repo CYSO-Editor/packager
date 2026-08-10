@@ -131,6 +131,7 @@
         "steamworksUnavailable": "要启用 Steamworks 扩展，你必须使用以下环境之一：",
         "steamworksWarning": "展示警告但继续",
         "storedWarning": "注意：此作品中已经存储了设置信息，可能会被覆盖。",
+        "cysoCoreElectronOnly": "这是一个 CYSO Core 作品，只能打包为 Electron 程序（EXE / APP / Linux）。HTML / Zip / NW.js / WKWebView 等选项已禁用。",
         "stretch": "拉伸舞台以填充屏幕而不改变实际大小（测试）",
         "turbo": "加速模式",
         "unFullscreenOnly": "仅离开全屏",
