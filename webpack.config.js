@@ -57,9 +57,10 @@ const makeScaffolding = ({full}) => ({
       'htmlparser2$': path.resolve(__dirname, 'src', 'scaffolding', 'htmlparser2'),
       'scratch-translate-extension-languages$': path.resolve(__dirname, 'src', 'scaffolding', 'scratch-translate-extension-languages', 'languages.json'),
       'scratch-parser$': path.resolve(__dirname, 'src', 'scaffolding', 'scratch-parser'),
-      // scratch-render-fonts is vendored inside scratch-vm/local-deps and is a peer dep
-      // that npm does not hoist into packager/node_modules; point to it directly.
-      'scratch-render-fonts': path.resolve(__dirname, '../scratch-vm/local-deps/scratch-render-fonts')
+      // Fonts live in scratch-gui's own copy (woff2, with the local CSS-injection tweaks).
+      // That module exports getFonts as module.exports and also carries .loadFonts/.FONTS,
+      // so it satisfies every consumer regardless of import style.
+      'scratch-render-fonts': path.resolve(__dirname, '../scratch-gui/src/lib/tw-scratch-render-fonts')
     }
   },
   module: {
@@ -71,7 +72,7 @@ const makeScaffolding = ({full}) => ({
           path.resolve(__dirname, 'src'),
           /node_modules[\\/]scratch-[^\\/]+[\\/]src/,
           path.resolve(__dirname, '../scratch-vm/src'),
-          path.resolve(__dirname, '../scratch-vm/local-deps')
+          path.resolve(__dirname, '../scratch-gui/src/lib/tw-scratch-render-fonts')
         ],
         options: {
           babelrc: false,
@@ -80,6 +81,14 @@ const makeScaffolding = ({full}) => ({
       },
       {
         test: /\.(svg|png)$/i,
+        use: [{
+          loader: 'url-loader'
+        }]
+      },
+      {
+        // The woff2 fonts in tw-scratch-render-fonts are plain `require`d, not base64-loader'd.
+        // Inline them as data URIs so the scaffolding stays a single self-contained bundle.
+        test: /\.woff2$/i,
         use: [{
           loader: 'url-loader'
         }]
