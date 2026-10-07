@@ -774,7 +774,7 @@ let permissionsLoaded = false;
 const initPermissions = () => {
   if (!permissionsLoaded) {
     const __cfg = (typeof __CYSO_CONFIG__ !== 'undefined' && __CYSO_CONFIG__) || {};
-    cysoPermissions = __cfg.extensionPermissions || {};
+    cysoPermissions = {};
     cysoCoreEnabled = !!__cfg.cysoCoreEnabled;
     permissionsLoaded = true;
   }
@@ -961,10 +961,7 @@ const _checkPermission = async (extensionId, permissionType) => {
   const permInfo = RISK_INFO[permissionType] || { level: 1, name: permissionType, risk: '未知风险' };
 
   if (!extensionId) {
-    if (cysoCoreEnabled) {
-      return { allowed: false, reason: 'no-extension-context', action: 'deny', notRequested: true };
-    }
-    return { allowed: true, reason: 'app', action: 'allow' };
+    return { allowed: false, reason: 'no-extension-context', action: 'deny', notRequested: true };
   }
 
   if (!Object.prototype.hasOwnProperty.call(cysoPermissions[extensionId] || {}, permissionType)) {
@@ -1025,15 +1022,7 @@ ipcMain.handle('register-extension-permissions', async (event, extensionId, requ
 });
 
 ipcMain.handle('get-permissions', () => cysoPermissions);
-ipcMain.handle('set-permissions', (event, permissions) => {
-  cysoPermissions = permissions || {};
-  return { success: true };
-});
 ipcMain.handle('get-cyso-core-enabled', () => cysoCoreEnabled);
-ipcMain.handle('set-cyso-core-enabled', (event, enabled) => {
-  cysoCoreEnabled = !!enabled;
-  return { success: true };
-});
 ipcMain.handle('check-permission', async (event, extensionId, permissionType) => {
   return await _checkPermission(extensionId, permissionType);
 });
@@ -1623,10 +1612,8 @@ const getActiveExtensionId = () => {
 
 contextBridge.exposeInMainWorld('EditorPreload', {
   getPermissions: () => ipcRenderer.invoke('get-permissions'),
-  setPermissions: (permissions) => ipcRenderer.invoke('set-permissions', permissions),
   checkPermission: (extensionId, permissionType) => ipcRenderer.invoke('check-permission', extensionId, permissionType),
   getCYSOCoreEnabled: () => ipcRenderer.invoke('get-cyso-core-enabled'),
-  setCYSOCoreEnabled: (enabled) => ipcRenderer.invoke('set-cyso-core-enabled', enabled),
   registerExtensionPermissions: (extensionId, requestedPermissions, extensionName) => ipcRenderer.invoke('register-extension-permissions', extensionId, requestedPermissions, extensionName),
 
   setActiveExtensionId: (id) => { activeExtensionId = id || null; },
