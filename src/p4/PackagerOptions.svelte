@@ -1,11 +1,12 @@
 <script>
   import {onDestroy} from 'svelte';
+  // Standard JSON can't represent values such as Infinity, which some options use.
+  import * as ExtendedJSON from '@turbowarp/json';
   import {_} from '../locales/';
   import {slide, fade} from 'svelte/transition';
   import Section from './Section.svelte';
   import Button from '../p4/Button.svelte';
   import ImageInput from './ImageInput.svelte';
-  import CustomExtensions from '../p4/CustomExtensions.svelte';
   import LearnMore from './LearnMore.svelte';
   import ColorPicker from './ColorPicker.svelte';
   import Downloads from './Downloads.svelte';
@@ -26,9 +27,6 @@
   export let projectData;
   export let title;
 
-  // JSON can't easily parse Infinity, so we'll just store large numbers instead
-  const ALMOST_INFINITY = 9999999999;
-
   const cloudVariables = projectData.project.analysis.stageVariables
     .filter(i => i.isCloud)
     .map(i => i.name);
@@ -40,14 +38,13 @@
   }
   defaultOptions.app.packageName = Packager.getDefaultPackageNameFromFileName(projectData.title);
   defaultOptions.app.windowTitle = Packager.getWindowTitleFromFileName(projectData.title);
-  defaultOptions.extensions = projectData.project.analysis.extensions;
   const options = writablePersistentStore(`PackagerOptions.${projectData.uniqueId}`, defaultOptions);
 
-  // Compatibility with https://github.com/TurboWarp/packager/commit/f66199abd1c896c11aa69247275a1594fdfc95b8
-  $options.extensions = $options.extensions.map(i => {
-    if (typeof i === 'object' && i) return i.url || '';
-    return i;
-  });
+  // Infinite clones used to be stored as a big number instead of actual `Infinity`.
+  const ALMOST_INFINITY = 9999999999;
+  if ($options.maxClones === ALMOST_INFINITY) {
+    $options.maxClones = Infinity;
+  }
 
   const hasMagicComment = (magic) => projectData.project.analysis.stageComments.find(
     (text) => text.split('\n').find((line) => line.endsWith(magic))
@@ -119,7 +116,6 @@
   const advancedOptionsInitiallyOpen = (
     $options.compiler.enabled !== defaultOptions.compiler.enabled ||
     $options.compiler.warpTimer !== defaultOptions.compiler.warpTimer ||
-    $options.extensions.length !== 0 ||
     $options.bakeExtensions !== defaultOptions.bakeExtensions ||
     $options.custom.css !== '' ||
     $options.custom.js !== '' ||
@@ -215,7 +211,7 @@
     try {
       result = await task.do(runPackager(task, optionsClone));
       task.done();
-      previewer.setContent(result.blob);
+      previewer.setContent(result.blob, optionsClone.app.windowTitle);
     } catch (e) {
       previewer.close();
     }
@@ -247,7 +243,7 @@
 
   const exportOptions = async () => {
     const exported = await recursivelySerializeBlobs($options);
-    const blob = new Blob([JSON.stringify(exported)], {
+    const blob = new Blob([ExtendedJSON.stringify(exported)], {
       type: 'application/json'
     });
     const url = URL.createObjectURL(blob);
@@ -279,10 +275,13 @@
     }
     try {
       const text = await readAsText(file);
-      const parsed = JSON.parse(text);
+      const parsed = ExtendedJSON.parse(text);
       const deserialized = recursivelyDeserializeBlobs(parsed);
       const copiedDefaultOptions = deepClone(defaultOptions);
       const mergedWithDefaults = merge(deserialized, copiedDefaultOptions);
+      if (mergedWithDefaults.maxClones === ALMOST_INFINITY) {
+        mergedWithDefaults.maxClones = Infinity;
+      }
 
       const isUnsafe = Packager.usesUnsafeOptions(mergedWithDefaults);
       if (!isUnsafe || confirm($_('options.confirmImportUnsafe'))) {
@@ -405,8 +404,8 @@
     </div>
     <div class="option">
       <label>
-        <input type="checkbox" checked={$options.maxClones === ALMOST_INFINITY} on:change={(e) => {
-          $options.maxClones = e.target.checked ? ALMOST_INFINITY : 300;
+        <input type="checkbox" checked={$options.maxClones === Infinity} on:change={(e) => {
+          $options.maxClones = e.target.checked ? Infinity : 300;
         }}>
         {$_('options.infiniteClones')}
       </label>
@@ -736,7 +735,6 @@
   reset={() => {
     resetOptions([
       'compiler',
-      'extensions',
       'bakeExtensions',
       'custom',
       'projectId',
@@ -763,16 +761,6 @@
         </label>
         <LearnMore slug="warp-timer" />
       </div>
-
-      <!-- Ignore because CustomExtensions will have a <textarea> inside it -->
-      <!-- svelte-ignore a11y-label-has-associated-control -->
-      <label class="option">
-        {$_('options.customExtensions')}
-        <!-- TODO: use the user-facing documentation when that becomes available -->
-        <LearnMore slug="development/custom-extensions" />
-        <CustomExtensions bind:extensions={$options.extensions} />
-        <p class="warning">{$_('options.customExtensionsSecurity')}</p>
-      </label>
 
       <label class="option">
         <input type="checkbox" bind:checked={$options.bakeExtensions}>
